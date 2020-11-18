@@ -1,5 +1,6 @@
+# simple optical character recognition (OCR)
 # import pytesseract
-# img = '/home/mnemonic/work/digits/real_source_2/21.jpg'
+# img = '~/work/digits/real_source_2/21.jpg'
 # custom_config = r'--oem 3 --psm 6 outputbase digits'
 # print(pytesseract.image_to_string(img, config=custom_config))
 
@@ -9,6 +10,7 @@
 
 # full screen opencv
 # https://answers.opencv.org/question/198479/display-a-streamed-video-in-full-screen-opencv3/
+
 
 import pyzbar.pyzbar as pyzbar
 import numpy as np
@@ -48,29 +50,31 @@ def get_logger(logger_name):
 
 # MySQL functions
 def create_table(config):
-    db_conn = mysql.connector.connect(**config)
-    with closing(db_conn) as conn:
-        with conn.cursor() as cursor:
-            cursor.execute('''CREATE TABLE IF NOT EXISTS qr_table 
+    conn = mysql.connector.connect(**config)
+    cursor = conn.cursor()
+    cursor.execute('''CREATE TABLE IF NOT EXISTS qr_table 
             (id INT NOT NULL AUTO_INCREMENT, 
             data VARCHAR(100) NOT NULL, 
             time TIMESTAMP NOT NULL, 
             route VARCHAR(10) NOT NULL, 
             check_flag INT NOT NULL, 
             PRIMARY KEY (id));''')
-            conn.commit()
+    conn.commit()
+    cursor.close()
+    conn.close()
 
 
 def push_to_db(qr_dict, config, qr_logger):
-    db_conn = mysql.connector.connect(**config)
-    with closing(db_conn) as conn:
-        with conn.cursor() as cursor:
-            placeholders = ', '.join(['%s'] * len(qr_dict))
-            columns = ', '.join(qr_dict.keys())
-            sql = "INSERT INTO %s ( %s ) VALUES ( %s )" % ('qr_table', columns, placeholders)
-            cursor.execute(sql, list(qr_dict.values()))
-            conn.commit()
-            qr_logger.info(f'New qr data insert in db. Data: {qr_dict}')
+    conn = mysql.connector.connect(**config)
+    cursor = conn.cursor()
+    placeholders = ', '.join(['%s'] * len(qr_dict))
+    columns = ', '.join(qr_dict.keys())
+    sql = "INSERT INTO %s ( %s ) VALUES ( %s )" % ('qr_table', columns, placeholders)
+    cursor.execute(sql, list(qr_dict.values()))
+    conn.commit()
+    cursor.close()
+    conn.close()
+    qr_logger.info(f'New qr data insert in db. Data: {qr_dict}')
 
 
 # Semantic functions
@@ -96,8 +100,7 @@ def process_qr(decodedObjects, fifo, camera_label, db_config, qr_logger):
     for obj in decodedObjects:
         if obj.data.decode("utf-8") not in fifo:
             fifo.append(obj.data.decode("utf-8"))
-            qr_logger.info(
-                f'Add {obj.data.decode("utf-8")} to fifo_{camera_label}. Current fifo_{camera_label}: {fifo}')
+            qr_logger.info(f'Add {obj.data.decode("utf-8")} to fifo_{camera_label}. Current fifo_{camera_label}: {fifo}')
     # clean fifo and pass only min_size_stock_last_data elements
     if len(fifo) > max_size_fifo:
         fifo = fifo[-min_size_fifo:]
@@ -134,16 +137,15 @@ def main():
     qr_logger.debug('Start program')
     # db config. You should create qr database, but qr_table table will create automatically if it not exist
     db_config = {
-        'host': "localhost",
-        'user': "mysql_user",
-        'password': "mysql_password",
-        'database': "qr"}
+        'host': "******",
+        'user': "******",
+        'password': "******",
+        'database': "******"}
     # labels will be use for 'route' row in db and naming window
     label_1 = '1'
     label_2 = '2'
-    # example rtsp source "rtsp://192.168.1.2:8080/out.h264"
-    source_1 = 'https://www.radiantmediaplayer.com/media/big-buck-bunny-360p.mp4'
-    source_2 = 0
+    source_1 = 'rtsp://user:passqord@ip:554/cam/realmonitor?channel=1&subtype=1'
+    source_2 = 'rtsp://user:passqord@ip:554/cam/realmonitor?channel=1&subtype=1'
 
     try:
         # create mysql table for qr data if not exist
@@ -187,7 +189,7 @@ def main():
             cv2.putText(frame_1, "FPS: %f" % (1.0 / (time.time() - last_time)),
                         (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
             cv2.putText(frame_2, "FPS: %f" % (1.0 / (time.time() - last_time)),
-                        (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                       (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
             # display the resulting frame
             cv2.imshow('1', frame_1)
             cv2.imshow('2', frame_2)
