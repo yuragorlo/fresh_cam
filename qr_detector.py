@@ -144,8 +144,8 @@ def main():
     # labels will be use for 'route' row in db and naming window
     label_1 = '1'
     label_2 = '2'
-    source_1 = 'rtsp://user:passqord@ip:554/cam/realmonitor?channel=1&subtype=1'
-    source_2 = 'rtsp://user:passqord@ip:554/cam/realmonitor?channel=1&subtype=1'
+    source_1 = 'rtsp://user:password@ip:554/cam/realmonitor?channel=1&subtype=1'
+    source_2 = 'rtsp://user:password@ip:554/cam/realmonitor?channel=1&subtype=1'
 
     try:
         # create mysql table for qr data if not exist
