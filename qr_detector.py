@@ -11,8 +11,8 @@
 # full screen opencv
 # https://answers.opencv.org/question/198479/display-a-streamed-video-in-full-screen-opencv3/
 
-
 import pyzbar.pyzbar as pyzbar
+from pyzbar.pyzbar import ZBarSymbol
 import numpy as np
 import mysql.connector
 import cv2
@@ -22,6 +22,8 @@ import logging
 from logging.handlers import TimedRotatingFileHandler
 from datetime import datetime
 from contextlib import closing
+from collections import deque
+from multiprocessing.pool import ThreadPool
 
 
 # Logger functions
@@ -88,23 +90,27 @@ def process_qr(decodedObjects, fifo, camera_label, db_config, qr_logger):
     # push new data to db
     if not any(item in current_data_list for item in fifo):
         for obj in decodedObjects:
-            # init dict with current data
-            now = datetime.now()
-            new_data = {'data': obj.data.decode("utf-8"),
-                        'time': now.strftime("%Y/%m/%d %H:%M:%S"),
-                        'route': camera_label,
-                        'check_flag': default_check_flag}
-            # insert new qr code info with time registration to qr_table qr database
-            push_to_db(new_data, db_config, qr_logger)
+            entrails_data = obj.data.decode("utf-8")
+            # mask for 94**********
+            if len(entrails_data) == 12 and entrails_data[:2] == '94':
+                # init dict with current data
+                now = datetime.now()
+                new_data = {'data': entrails_data,
+                            'time': now.strftime("%Y/%m/%d %H:%M:%S"),
+                            'route': camera_label,
+                            'check_flag': default_check_flag}
+                # insert new qr code info with time registration to qr_table qr database
+                push_to_db(new_data, db_config, qr_logger)
     # add new data to fifo
     for obj in decodedObjects:
         if obj.data.decode("utf-8") not in fifo:
             fifo.append(obj.data.decode("utf-8"))
-            qr_logger.info(f'Add {obj.data.decode("utf-8")} to fifo_{camera_label}. Current fifo_{camera_label}: {fifo}')
+            qr_logger.info(
+                f'Add {obj.data.decode("utf-8")} to fifo. Current fifo: {fifo}')
     # clean fifo and pass only min_size_stock_last_data elements
     if len(fifo) > max_size_fifo:
         fifo = fifo[-min_size_fifo:]
-        qr_logger.info(f'Free some of fifo_{camera_label}. Current fifo_{camera_label}: {fifo}')
+        qr_logger.info(f'Free some of fifo. Current fifo: {fifo}')
 
     return fifo
 
@@ -131,84 +137,100 @@ def add_qr_to_frame(frame, decodedObjects):
         cv2.putText(frame, barCode, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
 
 
+def process_frame(frame, fifo, db_label, db_config, qr_logger):
+    # read and transform frame to grey
+    im = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    # find qr code on frame
+    decodedObjects = pyzbar.decode(im, symbols=[ZBarSymbol.QRCODE])
+    if decodedObjects:
+        # update fifo and push to db if not in fifo
+        fifo = process_qr(decodedObjects, fifo, db_label, db_config, qr_logger)
+        # add square around qr and text with data on frame
+        add_qr_to_frame(frame, decodedObjects)
+    return frame, fifo
+
+
 def main():
-    # create logger
+
+    # input stream video, example 'https://www.radiantmediaplayer.com/media/big-buck-bunny-360p.mp4'
+    VIDEO_SOURCE_1 = 'rtsp://user:pass@ip:port/cam/realmonitor?channel=1&subtype=1'
+    VIDEO_SOURCE_2 = 'rtsp://user:pass@ip:port/cam/realmonitor?channel=1&subtype=1'
+
+    # DB_LABEL will be use for 'route' row in db and name window
+    DB_LABEL_1 = '1'
+    DB_LABEL_2 = '2'
+    # database configuration
+    DB_CONFIG = {
+        'host': "********",
+        'user': "********",
+        'password': "********",
+        'database': "********"}
+
+    # init logger
     qr_logger = get_logger('qr_detector')
     qr_logger.debug('Start program')
-    # db config. You should create qr database, but qr_table table will create automatically if it not exist
-    db_config = {
-        'host': "******",
-        'user': "******",
-        'password': "******",
-        'database': "******"}
-    # labels will be use for 'route' row in db and naming window
-    label_1 = '1'
-    label_2 = '2'
-    source_1 = 'rtsp://user:password@ip:554/cam/realmonitor?channel=1&subtype=1'
-    source_2 = 'rtsp://user:password@ip:554/cam/realmonitor?channel=1&subtype=1'
 
     try:
         # create mysql table for qr data if not exist
-        create_table(db_config)
-        # get streams
-        cap_1 = cv2.VideoCapture(source_1)
-        cap_2 = cv2.VideoCapture(source_2)
-        # resize caps (example size 1024.0 x 768.0; 1280.0 x 1024.0)
-        cap_1.set(3, 640)
-        cap_1.set(4, 480)
-        cap_2.set(3, 640)
-        cap_2.set(4, 480)
-        time.sleep(2)
-        # init fifo lists - short memory for qr data
+        create_table(DB_CONFIG)
+        # init memory list
         fifo_1 = []
         fifo_2 = []
-        # endless cycle
-        while (cap_1.isOpened()) or (cap_2.isOpened()):
+        # init ThreadPool
+        thread_num = cv2.getNumberOfCPUs()
+        pool_1 = ThreadPool(processes=thread_num)
+        pool_2 = ThreadPool(processes=thread_num)
+        pending_task_1 = deque()
+        pending_task_2 = deque()
+        # get and resize video
+        cap_1 = cv2.VideoCapture(VIDEO_SOURCE_1)
+        cap_1.set(3, 640)
+        cap_1.set(4, 480)
+        cap_2 = cv2.VideoCapture(VIDEO_SOURCE_2)
+        cap_2.set(3, 640)
+        cap_2.set(4, 480)
+
+        while True:
             # fix time
             last_time = time.time()
-            # capture frame-by-frame
-            ret_1, frame_1 = cap_1.read()
-            ret_2, frame_2 = cap_2.read()
-            # convert to grey
-            im_1 = cv2.cvtColor(frame_1, cv2.COLOR_BGR2GRAY)
-            im_2 = cv2.cvtColor(frame_2, cv2.COLOR_BGR2GRAY)
-            # detecting qr in frames
-            decodedObjects_1 = pyzbar.decode(im_1)
-            decodedObjects_2 = pyzbar.decode(im_2)
-            if decodedObjects_1:
-                # update fifo and push to db if not in fifo
-                fifo_1 = process_qr(decodedObjects_1, fifo_1, label_1, db_config, qr_logger)
-                # add square around qr and text with data on frame
-                add_qr_to_frame(frame_1, decodedObjects_1)
-            if decodedObjects_2:
-                # update stock and push to db if not in fifo
-                fifo_2 = process_qr(decodedObjects_2, fifo_2, label_2, db_config, qr_logger)
-                # add square around qr and text with data on frame
-                add_qr_to_frame(frame_2, decodedObjects_2)
-            # display FPS:
-            cv2.putText(frame_1, "FPS: %f" % (1.0 / (time.time() - last_time)),
-                        (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-            cv2.putText(frame_2, "FPS: %f" % (1.0 / (time.time() - last_time)),
-                       (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-            # display the resulting frame
-            cv2.imshow('1', frame_1)
-            cv2.imshow('2', frame_2)
+            # populate the queue
+            if len(pending_task_1) < thread_num:
+                frame_got, frame = cap_1.read()
+                if frame_got:
+                    task = pool_1.apply_async(process_frame, (frame.copy(), fifo_1, DB_LABEL_1, DB_CONFIG, qr_logger,))
+                    pending_task_1.append(task)
+            if len(pending_task_2) < thread_num:
+                frame_got, frame = cap_2.read()
+                if frame_got:
+                    task = pool_2.apply_async(process_frame, (frame.copy(), fifo_2, DB_LABEL_2, DB_CONFIG, qr_logger,))
+                    pending_task_2.append(task)
+            # consume the queue
+            while len(pending_task_1) > 0 and pending_task_1[0].ready():
+                res = pending_task_1.popleft().get()
+                frame_show = res[0]
+                # display FPS:
+                cv2.putText(frame_show, "FPS: %f" % (1.0 / (time.time() - last_time)),
+                            (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                cv2.imshow(f'{DB_LABEL_1}_windows', frame_show)
+            while len(pending_task_2) > 0 and pending_task_2[0].ready():
+                res = pending_task_2.popleft().get()
+                frame_show = res[0]
+                # display FPS:
+                cv2.putText(frame_show, "FPS: %f" % (1.0 / (time.time() - last_time)),
+                            (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                cv2.imshow(f'{DB_LABEL_2}_windows', frame_show)
             # control keys
             key = cv2.waitKey(1)
             if key & 0xFF == ord('q'):
                 break
             elif key & 0xFF == ord('s'):  # press 's' key to save
-                cv2.imwrite('Capture.png', frame_1)
-            elif key & 0xFF == ord('z'):  # press 'z' key to save
-                cv2.imwrite('Capture.png', frame_2)
-        # when everything done, release the capture
-        cap_1.release()
-        cap_2.release()
+                cv2.imwrite('Capture.png', frame)
         cv2.destroyAllWindows()
         qr_logger.debug('End program')
 
     except Exception as e:
         qr_logger.error(e, exc_info=True)
+
 
 
 if __name__ == '__main__':
