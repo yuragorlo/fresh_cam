@@ -1,8 +1,0 @@
-mysql==0.0.2
-mysql-connector-python==8.0.22
-mysqlclient==2.0.1
-numpy==1.19.4
-opencv-python==4.4.0.46
-protobuf==3.13.0
-pyzbar==0.1.8
-six==1.15.0
