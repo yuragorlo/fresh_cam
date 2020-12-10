@@ -1,29 +1,40 @@
-# simple optical character recognition (OCR)
-# import pytesseract
-# img = '~/work/digits/real_source_2/21.jpg'
-# custom_config = r'--oem 3 --psm 6 outputbase digits'
-# print(pytesseract.image_to_string(img, config=custom_config))
-
-# read hid device python
-# https://www.ontrak.net/pythonhidapi.htm
-# https://pypi.org/project/hid/
-
-# full screen opencv
-# https://answers.opencv.org/question/198479/display-a-streamed-video-in-full-screen-opencv3/
-
-import pyzbar.pyzbar as pyzbar
-from pyzbar.pyzbar import ZBarSymbol
-import numpy as np
 import mysql.connector
 import cv2
 import time
-import sys
 import logging
+import sys
+import os
+import usb.core
+import usb.util
+import pyzbar.pyzbar as pyzbar
+import numpy as np
 from logging.handlers import TimedRotatingFileHandler
 from datetime import datetime
-from contextlib import closing
 from collections import deque
 from multiprocessing.pool import ThreadPool
+from PIL import ImageFont, ImageDraw, Image
+from pyzbar.pyzbar import ZBarSymbol
+
+
+# CONFIGURE SYSTEM
+# VIDEO
+VIDEO_SOURCE_1 = 0
+VIDEO_SOURCE_2 = 'https://www.radiantmediaplayer.com/media/big-buck-bunny-360p.mp4'
+# HAND SCANNER
+ID_VENDOR = 0x1a2c
+ID_PRODUCT = 0x2d23
+# SOUND
+DURATION = 1
+FREQ = 740
+# DATABASE
+DB_LABEL_1 = 'up'
+DB_LABEL_2 = 'right'
+DEFAULT_FLAG = 0
+DB_CONFIG = {
+    'host': "localhost",
+    'user': "mysql_user",
+    'password': "mysql_password",
+    'database': "qr"}
 
 
 # Logger functions
@@ -66,8 +77,8 @@ def create_table(config):
     conn.close()
 
 
-def push_to_db(qr_dict, config, qr_logger):
-    conn = mysql.connector.connect(**config)
+def push_to_db(qr_dict, qr_logger):
+    conn = mysql.connector.connect(**DB_CONFIG)
     cursor = conn.cursor()
     placeholders = ', '.join(['%s'] * len(qr_dict))
     columns = ', '.join(qr_dict.keys())
@@ -79,158 +90,303 @@ def push_to_db(qr_dict, config, qr_logger):
     qr_logger.info(f'New qr data insert in db. Data: {qr_dict}')
 
 
-# Semantic functions
-def process_qr(decodedObjects, fifo, camera_label, db_config, qr_logger):
-    # configure fifo
-    min_size_fifo = 3
-    max_size_fifo = 7
-    default_check_flag = 0
-    # get list of current qr objects from video stream
+# Hand scanner functions
+def hid2ascii(lst, qr_logger):
+    conv_table = {30: ['1', '!'], 31: ['2', '@'], 32: ['3', '#'], 33: ['4', '$'], 34: ['5', '%'],
+                  35: ['6', '^'], 36: ['7', '&'], 37: ['8', '*'], 38: ['9', '('], 39: ['0', ')']}
+    if lst[0] == 2:
+        shift = 1
+    else:
+        shift = 0
+    ch = lst[2]
+    if ch not in conv_table:
+        qr_logger.info("Warning: data not in conversion table")
+        return ''
+    return conv_table[ch][shift]
+
+
+def get_scanner():
+    # Find our device using the VID (Vendor ID) and PID (Product ID)
+    dev = usb.core.find(idVendor=ID_VENDOR, idProduct=ID_PRODUCT)
+    if dev is None:
+        raise ValueError('USB device not found')
+    # Detach the kernel driver so we can use interface (one user per interface)
+    for config in dev:
+        for i in range(config.bNumInterfaces):
+            if dev.is_kernel_driver_active(i):
+                dev.detach_kernel_driver(i)
+    # Set the active configuration. With no arguments, the first configuration will be the active one
+    dev.set_configuration()
+    # Get an endpoint instance
+    cfg = dev.get_active_configuration()
+    intf = cfg[(0, 0)]
+    ep = usb.util.find_descriptor(intf, custom_match = lambda e: \
+                usb.util.endpoint_direction(e.bEndpointAddress) == \
+                usb.util.ENDPOINT_IN)
+    return ep
+
+
+def get_scanner_data(ep, qr_logger):
+    try:
+        # Wait up to 0.05 seconds for data.
+        timeout = 50
+        data = ep.read(1000, timeout)
+        ch = hid2ascii(data, qr_logger)
+        return ch
+    except usb.core.USBError:
+        # Timed out. End of the data stream. Print the scan line.
+        return None
+
+
+# Sound function
+def play_sound(duration, freq):
+    os.system(f'play -nq -t alsa synth {duration} sine {freq}')
+
+
+# Async functions
+def add_video_task(pending_task, pool, cap, fifo, DB_LABEL, qr_logger):
+    frame_got, frame = cap.read()
+    if frame_got:
+        task = pool.apply_async(process_frame, (frame.copy(), fifo, DB_LABEL, qr_logger,))
+        pending_task.append(task)
+
+
+def add_scanner_task(pending_task, pool, ep, qr_logger):
+    task = pool.apply_async(process_scanner, (ep, qr_logger, ))
+    pending_task.append(task)
+
+
+def add_sound_task(pending_task, pool):
+    task = pool.apply_async(play_sound, (DURATION, FREQ, ))
+    pending_task.append(task)
+
+
+def get_frame(pending_task, last_time, FPS=True):
+    res = pending_task.popleft().get()
+    frame = res[0]
+    fifo = res[1]
+    decodedObjects = res[2]
+    sound = res[3]
+    # Display FPS:
+    if FPS:
+        cv2.putText(frame, "FPS: %f" % (1.0 / (time.time() - last_time)),
+                    (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    return frame, fifo, decodedObjects, sound
+
+
+def get_scanner_ch(pending_task):
+    res = pending_task.popleft().get()
+    return res
+
+
+def get_sound(pending_task):
+    pending_task.popleft().get()
+
+
+# Process functions
+def process_frame(frame, fifo, db_label, qr_logger):
+    # read and transform frame to grey
+    im = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    # Find qr code on frame
+    decodedObjects = pyzbar.decode(im, symbols=[ZBarSymbol.QRCODE])
+    if decodedObjects:
+        # Update fifo and push to db if not in fifo
+        fifo, sound = process_qr(decodedObjects, fifo, db_label, qr_logger)
+        # Add square around qr and text with data on frame
+        add_qr_to_frame(frame, decodedObjects)
+    else:
+        sound = False
+    return frame, fifo, decodedObjects, sound
+
+
+def process_qr(decodedObjects, fifo, camera_label, qr_logger):
+    sound = False
+    # Get list of current qr objects from video stream
     current_data_list = [x.data.decode("utf-8") for x in decodedObjects]
-    # push new data to db
+    # Push new data to db
     if not any(item in current_data_list for item in fifo):
         for obj in decodedObjects:
             entrails_data = obj.data.decode("utf-8")
-            # mask for 94**********
+            # Mask for 94**********
             if len(entrails_data) == 12 and entrails_data[:2] == '94':
-                # init dict with current data
+                # Init dict with current data
                 now = datetime.now()
                 new_data = {'data': entrails_data,
                             'time': now.strftime("%Y/%m/%d %H:%M:%S"),
                             'route': camera_label,
-                            'check_flag': default_check_flag}
-                # insert new qr code info with time registration to qr_table qr database
-                push_to_db(new_data, db_config, qr_logger)
-    # add new data to fifo
+                            'check_flag': DEFAULT_FLAG}
+                # Insert new qr code info with time registration to qr_table qr database
+                push_to_db(new_data, qr_logger)
+                sound = True
+    # Add new data to fifo
     for obj in decodedObjects:
         if obj.data.decode("utf-8") not in fifo:
             fifo.append(obj.data.decode("utf-8"))
             qr_logger.info(
                 f'Add {obj.data.decode("utf-8")} to fifo. Current fifo: {fifo}')
-    # clean fifo and pass only min_size_stock_last_data elements
-    if len(fifo) > max_size_fifo:
-        fifo = fifo[-min_size_fifo:]
+    # Clean fifo and pass only min_size_stock_last_data elements
+    if len(fifo) > 7:
+        fifo = fifo[-3:]
         qr_logger.info(f'Free some of fifo. Current fifo: {fifo}')
+    return fifo, sound
 
-    return fifo
+
+def process_scanner(ep, qr_logger):
+    return get_scanner_data(ep, qr_logger)
 
 
+def get_last_or_empty(in_list, obj_process):
+    if in_list:
+        if obj_process:
+            return in_list[-1].data.decode("utf-8")
+        else:
+            return in_list[-1]
+    else:
+        return ''
+
+
+# Display functions
 def add_qr_to_frame(frame, decodedObjects):
     for decodedObject in decodedObjects:
-        # draw square around qr
+        # Draw square around qr
         points = decodedObject.polygon
-        # if the points do not form a quad, find convex hull
+        # If the points do not form a quad, find convex hull
         if len(points) > 4:
             hull = cv2.convexHull(np.array([point for point in points], dtype=np.float32))
             hull = list(map(tuple, np.squeeze(hull)))
         else:
             hull = points
-        # number of points in the convex hull
+        # Number of points in the convex hull
         n = len(hull)
-        # draw the convex hull
+        # Draw the convex hull
         for j in range(0, n):
             cv2.line(frame, hull[j], hull[(j + 1) % n], (0, 0, 255), 3)
-        # show text
-        x = decodedObject.rect.left
-        y = decodedObject.rect.top
-        barCode = str(decodedObject.data.decode("utf-8"))
-        cv2.putText(frame, barCode, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
 
 
-def process_frame(frame, fifo, db_label, db_config, qr_logger):
-    # read and transform frame to grey
-    im = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    # find qr code on frame
-    decodedObjects = pyzbar.decode(im, symbols=[ZBarSymbol.QRCODE])
-    if decodedObjects:
-        # update fifo and push to db if not in fifo
-        fifo = process_qr(decodedObjects, fifo, db_label, db_config, qr_logger)
-        # add square around qr and text with data on frame
-        add_qr_to_frame(frame, decodedObjects)
-    return frame, fifo
+def create_bord(concat_video, show_data):
+    last_qr_1, last_qr_2, last_qr_scanner, current_qr_1, current_qr_2, scanner_digits = show_data
+    colors = {'GREY': (51, 51, 51),
+              'WHITE': (255, 255, 255),
+              'WHITE_': (255, 255, 255, 0),
+              'RED': (51, 51, 255, 0),
+              'GREEN': (102, 153, 0)}
+    # Make new result window
+    img = np.ones((int(concat_video.shape[1] * 0.75), concat_video.shape[1], concat_video.shape[2]), np.uint8)
+    # Fill background
+    img[:,:] = colors['GREY']
+    # Put video to result window
+    img[:concat_video.shape[0], :concat_video.shape[1], :concat_video.shape[2]] = concat_video
+    # Get shapes
+    h, w, ch = img.shape[0], img.shape[1], img.shape[2]
+    # Draw rectangle on frame
+    cv2.rectangle(img, (int(w * 0.01), int(h * 0.6)), (int(w * 0.32), int(h * 0.7)), colors['WHITE'], -1)
+    cv2.rectangle(img, (int(w * 0.01), int(h * 0.8)), (int(w * 0.32), int(h * 0.9)), colors['GREEN'], -1)
+    cv2.rectangle(img, (int(w * 0.34), int(h * 0.6)), (int(w * 0.65), int(h * 0.7)), colors['WHITE'], -1)
+    cv2.rectangle(img, (int(w * 0.34), int(h * 0.8)), (int(w * 0.65), int(h * 0.9)), colors['GREEN'], -1)
+    cv2.rectangle(img, (int(w * 0.67), int(h * 0.6)), (int(w * 0.99), int(h * 0.7)), colors['WHITE'], -1)
+    cv2.rectangle(img, (int(w * 0.67), int(h * 0.8)), (int(w * 0.99), int(h * 0.9)), colors['GREEN'], -1)
+    img_pil = Image.fromarray(img)
+    # Write text on frame
+    font = ImageFont.truetype("Gouranga-Pixel.ttf", 20)
+    draw = ImageDraw.Draw(img_pil)
+    draw.text((int(w * 0.01), int(h * 0.58)), "РАСПОЗНАНО С ВЕРХНЕЙ КАМЕРЫ", font=font, fill=(colors['WHITE_']))
+    draw.text((int(w * 0.01), int(h * 0.78)), "ПРОВЕРЕНО С ВЕРХНЕЙ КАМЕРЫ", font=font, fill=(colors['WHITE_']))
+    draw.text((int(w * 0.34), int(h * 0.58)), "РАСПОЗНАНО С БОКОВОЙ КАМЕРЫ", font=font, fill=(colors['WHITE_']))
+    draw.text((int(w * 0.34), int(h * 0.78)), "ПРОВЕРЕНО С БОКОВОЙ КАМЕРЫ", font=font, fill=(colors['WHITE_']))
+    draw.text((int(w * 0.67), int(h * 0.58)), "РАСПОЗНАНО РУЧНЫМ СКАНЕРОМ", font=font, fill=(colors['WHITE_']))
+    draw.text((int(w * 0.67), int(h * 0.78)), "ПРОВЕРЕНО С РУЧНОГО СКАНЕРА", font=font, fill=(colors['WHITE_']))
+    # Write qr values (digits) in rectangles
+    font = ImageFont.truetype("Gouranga-Pixel.ttf", 40)
+    draw.text((int(w * 0.07), int(h * 0.63)), current_qr_1, font=font, fill=(colors['RED']))
+    draw.text((int(w * 0.39), int(h * 0.63)), current_qr_2, font=font, fill=(colors['RED']))
+    draw.text((int(w * 0.73), int(h * 0.63)), scanner_digits, font=font, fill=(colors['RED']))
+    draw.text((int(w * 0.07), int(h * 0.83)), last_qr_1, font=font, fill=(colors['WHITE']))
+    draw.text((int(w * 0.39), int(h * 0.83)), last_qr_2, font=font, fill=(colors['WHITE']))
+    draw.text((int(w * 0.73), int(h * 0.83)), last_qr_scanner, font=font, fill=(colors['WHITE']))
+    return np.array(img_pil)
 
 
 def main():
-
-    # input stream video, example 'https://www.radiantmediaplayer.com/media/big-buck-bunny-360p.mp4'
-    VIDEO_SOURCE_1 = 'rtsp://user:pass@ip:port/cam/realmonitor?channel=1&subtype=1'
-    VIDEO_SOURCE_2 = 'rtsp://user:pass@ip:port/cam/realmonitor?channel=1&subtype=1'
-
-    # DB_LABEL will be use for 'route' row in db and name window
-    DB_LABEL_1 = '1'
-    DB_LABEL_2 = '2'
-    # database configuration
-    DB_CONFIG = {
-        'host': "********",
-        'user': "********",
-        'password': "********",
-        'database': "********"}
-
-    # init logger
+    # Init logger
     qr_logger = get_logger('qr_detector')
     qr_logger.debug('Start program')
-
+    thread_num = cv2.getNumberOfCPUs()
     try:
-        # create mysql table for qr data if not exist
+        # Init scanner
+        ep = get_scanner()
+        scanner_digits = ''
+        # Create mysql table for qr data if not exist
         create_table(DB_CONFIG)
-        # init memory list
+        # Init memory list
         fifo_1 = []
         fifo_2 = []
-        # init ThreadPool
-        thread_num = cv2.getNumberOfCPUs()
-        pool_1 = ThreadPool(processes=thread_num)
-        pool_2 = ThreadPool(processes=thread_num)
-        pending_task_1 = deque()
-        pending_task_2 = deque()
-        # get and resize video
-        cap_1 = cv2.VideoCapture(VIDEO_SOURCE_1)
-        cap_1.set(3, 640)
-        cap_1.set(4, 480)
-        cap_2 = cv2.VideoCapture(VIDEO_SOURCE_2)
-        cap_2.set(3, 640)
-        cap_2.set(4, 480)
-
+        fifo_3 = []
+        # Init ThreadPool and tasks
+        pool = ThreadPool(processes=thread_num)
+        video_tasks_1 = deque()
+        video_tasks_2 = deque()
+        scanner_tasks = deque()
+        sound_tasks = deque()
+        # Get video
+        cap_1 = cv2.VideoCapture(VIDEO_SOURCE_2)
+        cap_2 = cv2.VideoCapture(VIDEO_SOURCE_1)
         while True:
-            # fix time
+            # Fix time
             last_time = time.time()
-            # populate the queue
-            if len(pending_task_1) < thread_num:
-                frame_got, frame = cap_1.read()
-                if frame_got:
-                    task = pool_1.apply_async(process_frame, (frame.copy(), fifo_1, DB_LABEL_1, DB_CONFIG, qr_logger,))
-                    pending_task_1.append(task)
-            if len(pending_task_2) < thread_num:
-                frame_got, frame = cap_2.read()
-                if frame_got:
-                    task = pool_2.apply_async(process_frame, (frame.copy(), fifo_2, DB_LABEL_2, DB_CONFIG, qr_logger,))
-                    pending_task_2.append(task)
-            # consume the queue
-            while len(pending_task_1) > 0 and pending_task_1[0].ready():
-                res = pending_task_1.popleft().get()
-                frame_show = res[0]
-                # display FPS:
-                cv2.putText(frame_show, "FPS: %f" % (1.0 / (time.time() - last_time)),
-                            (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                cv2.imshow(f'{DB_LABEL_1}_windows', frame_show)
-            while len(pending_task_2) > 0 and pending_task_2[0].ready():
-                res = pending_task_2.popleft().get()
-                frame_show = res[0]
-                # display FPS:
-                cv2.putText(frame_show, "FPS: %f" % (1.0 / (time.time() - last_time)),
-                            (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                cv2.imshow(f'{DB_LABEL_2}_windows', frame_show)
-            # control keys
+            # Add tasks
+            if (len(video_tasks_1) + len(video_tasks_2) + len(scanner_tasks)) < thread_num:
+                add_video_task(video_tasks_1, pool, cap_1, fifo_1, DB_LABEL_1, qr_logger)
+                add_video_task(video_tasks_2, pool, cap_2, fifo_2, DB_LABEL_2, qr_logger)
+                add_scanner_task(scanner_tasks, pool, ep, qr_logger)
+            if len(sound_tasks)<1:
+                add_sound_task(sound_tasks, pool)
+            while len(video_tasks_1) > 0 and video_tasks_1[0].ready() and\
+                    len(video_tasks_2) > 0 and video_tasks_2[0].ready():
+                # Get frames and info about frames from tasks
+                frame_show_1, fifo_1, decodedObjects_1, sound_1 = get_frame(video_tasks_1, last_time, FPS=True)
+                frame_show_2, fifo_2, decodedObjects_2, sound_2 = get_frame(video_tasks_2, last_time, FPS=True)
+                if (sound_1 or sound_2) and len(sound_tasks)>0:
+                    get_sound(sound_tasks)
+                scanner_digit = get_scanner_ch(scanner_tasks)
+                if scanner_digit:
+                    scanner_digits = scanner_digits + str(scanner_digit)
+                if len(scanner_digits) >= 12:
+                    if scanner_digits[:2] == '94' and scanner_digits not in fifo_3:
+                        fifo_3.append(scanner_digits)
+                        now = datetime.now()
+                        new_data = {'data': scanner_digits,
+                                    'time': now.strftime("%Y/%m/%d %H:%M:%S"),
+                                    'route': 'scanner',
+                                    'check_flag': DEFAULT_FLAG}
+                        # Insert new qr code info with time registration to qr_table qr database
+                        push_to_db(new_data, qr_logger)
+                    scanner_digits = ''
+                    if len(fifo_3)>7:
+                        fifo_3 = fifo_3[-3:]
+
+                # Resize
+                frame_show_2 = frame_show_2[:360, :, :]
+                # Get current data for draw
+                last_qr_1 = get_last_or_empty(fifo_1, False)
+                last_qr_2 = get_last_or_empty(fifo_2, False)
+                last_qr_scanner = get_last_or_empty(fifo_3, False)
+                current_qr_1 = get_last_or_empty(decodedObjects_1, True)
+                current_qr_2 = get_last_or_empty(decodedObjects_2, True)
+                show_data = [last_qr_1, last_qr_2, last_qr_scanner, current_qr_1, current_qr_2, scanner_digits]
+                # Draw final window
+                im = cv2.resize(create_bord(cv2.hconcat([frame_show_1, frame_show_2]), show_data), (1024, 768))
+                cv2.namedWindow('QR_registrator', cv2.WND_PROP_FULLSCREEN)
+                cv2.moveWindow('QR_registrator', 0, 0)
+                cv2.setWindowProperty('QR_registrator', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+                cv2.imshow('QR_registrator', im)
+            # Press q to quit
             key = cv2.waitKey(1)
             if key & 0xFF == ord('q'):
                 break
-            elif key & 0xFF == ord('s'):  # press 's' key to save
-                cv2.imwrite('Capture.png', frame)
         cv2.destroyAllWindows()
         qr_logger.debug('End program')
-
     except Exception as e:
         qr_logger.error(e, exc_info=True)
-
 
 
 if __name__ == '__main__':
