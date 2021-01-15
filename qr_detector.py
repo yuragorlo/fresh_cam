@@ -18,11 +18,11 @@ from pyzbar.pyzbar import ZBarSymbol
 
 # CONFIGURE SYSTEM
 # VIDEO
-VIDEO_SOURCE_1 = 0
-VIDEO_SOURCE_2 = 'https://www.radiantmediaplayer.com/media/big-buck-bunny-360p.mp4'
+VIDEO_SOURCE_1 = '****'
+VIDEO_SOURCE_2 = '****'
 # HAND SCANNER
-ID_VENDOR = 0x1a2c
-ID_PRODUCT = 0x2d23
+ID_VENDOR = '****'
+ID_PRODUCT = '****'
 # SOUND
 DURATION = 1
 FREQ = 740
@@ -31,11 +31,12 @@ DB_LABEL_1 = 'up'
 DB_LABEL_2 = 'right'
 DEFAULT_FLAG = 0
 DB_CONFIG = {
-    'host': "localhost",
-    'user': "mysql_user",
-    'password': "mysql_password",
+    'host': '****'
+    'user': '****',
+    'password': '****',
     'database': "qr"}
-
+# DISPLAY
+LIGHT_DELAY = 5 # second
 
 # Logger functions
 def get_file_handler():
@@ -191,7 +192,7 @@ def process_frame(frame, fifo, db_label, qr_logger):
     decodedObjects = pyzbar.decode(im, symbols=[ZBarSymbol.QRCODE])
     if decodedObjects:
         # Update fifo and push to db if not in fifo
-        fifo, sound = process_qr(decodedObjects, fifo, db_label, qr_logger)
+        fifo, sound = process_qrs(decodedObjects, fifo, db_label, qr_logger)
         # Add square around qr and text with data on frame
         add_qr_to_frame(frame, decodedObjects)
     else:
@@ -199,35 +200,34 @@ def process_frame(frame, fifo, db_label, qr_logger):
     return frame, fifo, decodedObjects, sound
 
 
-def process_qr(decodedObjects, fifo, camera_label, qr_logger):
+def process_obj(data, fifo, camera_label, qr_logger):
+    sound = False
+    if len(data) >= 12:
+        if data[:2] == '94' and data not in fifo:
+            fifo.append(data)
+            qr_logger.info( f'Add {data} to fifo. Current fifo: {fifo}')
+            now = datetime.now()
+            new_data = {'data': data,
+                        'time': now.strftime("%Y/%m/%d %H:%M:%S"),
+                        'route': camera_label,
+                        'check_flag': DEFAULT_FLAG}
+            # Insert new qr code with time registration to qr_table qr database
+            push_to_db(new_data, qr_logger)
+            sound = True
+        data = ''
+        # Delete part of fifo
+        if len(fifo) > 7:
+            fifo = fifo[-3:]
+            qr_logger.info(f'Free some of fifo. Current fifo: {fifo}')
+    return fifo, data, sound
+
+
+def process_qrs(decodedObjects, fifo, camera_label, qr_logger):
     sound = False
     # Get list of current qr objects from video stream
     current_data_list = [x.data.decode("utf-8") for x in decodedObjects]
-    # Push new data to db
-    if not any(item in current_data_list for item in fifo):
-        for obj in decodedObjects:
-            entrails_data = obj.data.decode("utf-8")
-            # Mask for 94**********
-            if len(entrails_data) == 12 and entrails_data[:2] == '94':
-                # Init dict with current data
-                now = datetime.now()
-                new_data = {'data': entrails_data,
-                            'time': now.strftime("%Y/%m/%d %H:%M:%S"),
-                            'route': camera_label,
-                            'check_flag': DEFAULT_FLAG}
-                # Insert new qr code info with time registration to qr_table qr database
-                push_to_db(new_data, qr_logger)
-                sound = True
-    # Add new data to fifo
-    for obj in decodedObjects:
-        if obj.data.decode("utf-8") not in fifo:
-            fifo.append(obj.data.decode("utf-8"))
-            qr_logger.info(
-                f'Add {obj.data.decode("utf-8")} to fifo. Current fifo: {fifo}')
-    # Clean fifo and pass only min_size_stock_last_data elements
-    if len(fifo) > 7:
-        fifo = fifo[-3:]
-        qr_logger.info(f'Free some of fifo. Current fifo: {fifo}')
+    for data in current_data_list:
+        fifo, data, sound = process_obj(data, fifo, camera_label, qr_logger)
     return fifo, sound
 
 
@@ -264,12 +264,40 @@ def add_qr_to_frame(frame, decodedObjects):
 
 
 def create_bord(concat_video, show_data):
-    last_qr_1, last_qr_2, last_qr_scanner, current_qr_1, current_qr_2, scanner_digits = show_data
+    fifo_1, fifo_2, fifo_3,\
+    decodedObjects_1, decodedObjects_2, scanner_digits,\
+    light_label_1, light_label_2, light_label_3 = show_data
+    # Get data
+    last_qr_1 = get_last_or_empty(fifo_1, False)
+    last_qr_2 = get_last_or_empty(fifo_2, False)
+    last_qr_scanner = get_last_or_empty(fifo_3, False)
+    current_qr_1 = get_last_or_empty(decodedObjects_1, True)
+    current_qr_2 = get_last_or_empty(decodedObjects_2, True)
+    # Define colors
     colors = {'GREY': (51, 51, 51),
               'WHITE': (255, 255, 255),
               'WHITE_': (255, 255, 255, 0),
               'RED': (51, 51, 255, 0),
               'GREEN': (102, 153, 0)}
+    # Change colors depend on lights
+    if light_label_1:
+        color_rec_1 = colors['GREEN']
+        color_text_1 = colors['WHITE']
+    else:
+        color_rec_1 = colors['WHITE']
+        color_text_1 = colors['GREY']
+    if light_label_2:
+        color_rec_2 = colors['GREEN']
+        color_text_2 = colors['WHITE']
+    else:
+        color_rec_2 = colors['WHITE']
+        color_text_2 = colors['GREY']
+    if light_label_3:
+        color_rec_3 = colors['GREEN']
+        color_text_3 = colors['WHITE']
+    else:
+        color_rec_3 = colors['WHITE']
+        color_text_3 = colors['GREY']
     # Make new result window
     img = np.ones((int(concat_video.shape[1] * 0.75), concat_video.shape[1], concat_video.shape[2]), np.uint8)
     # Fill background
@@ -280,11 +308,11 @@ def create_bord(concat_video, show_data):
     h, w, ch = img.shape[0], img.shape[1], img.shape[2]
     # Draw rectangle on frame
     cv2.rectangle(img, (int(w * 0.01), int(h * 0.6)), (int(w * 0.32), int(h * 0.7)), colors['WHITE'], -1)
-    cv2.rectangle(img, (int(w * 0.01), int(h * 0.8)), (int(w * 0.32), int(h * 0.9)), colors['GREEN'], -1)
+    cv2.rectangle(img, (int(w * 0.01), int(h * 0.8)), (int(w * 0.32), int(h * 0.9)), color_rec_1, -1)
     cv2.rectangle(img, (int(w * 0.34), int(h * 0.6)), (int(w * 0.65), int(h * 0.7)), colors['WHITE'], -1)
-    cv2.rectangle(img, (int(w * 0.34), int(h * 0.8)), (int(w * 0.65), int(h * 0.9)), colors['GREEN'], -1)
+    cv2.rectangle(img, (int(w * 0.34), int(h * 0.8)), (int(w * 0.65), int(h * 0.9)), color_rec_2, -1)
     cv2.rectangle(img, (int(w * 0.67), int(h * 0.6)), (int(w * 0.99), int(h * 0.7)), colors['WHITE'], -1)
-    cv2.rectangle(img, (int(w * 0.67), int(h * 0.8)), (int(w * 0.99), int(h * 0.9)), colors['GREEN'], -1)
+    cv2.rectangle(img, (int(w * 0.67), int(h * 0.8)), (int(w * 0.99), int(h * 0.9)), color_rec_3, -1)
     img_pil = Image.fromarray(img)
     # Write text on frame
     font = ImageFont.truetype("Gouranga-Pixel.ttf", 20)
@@ -300,9 +328,9 @@ def create_bord(concat_video, show_data):
     draw.text((int(w * 0.07), int(h * 0.63)), current_qr_1, font=font, fill=(colors['RED']))
     draw.text((int(w * 0.39), int(h * 0.63)), current_qr_2, font=font, fill=(colors['RED']))
     draw.text((int(w * 0.73), int(h * 0.63)), scanner_digits, font=font, fill=(colors['RED']))
-    draw.text((int(w * 0.07), int(h * 0.83)), last_qr_1, font=font, fill=(colors['WHITE']))
-    draw.text((int(w * 0.39), int(h * 0.83)), last_qr_2, font=font, fill=(colors['WHITE']))
-    draw.text((int(w * 0.73), int(h * 0.83)), last_qr_scanner, font=font, fill=(colors['WHITE']))
+    draw.text((int(w * 0.07), int(h * 0.83)), last_qr_1, font=font, fill=color_text_1)
+    draw.text((int(w * 0.39), int(h * 0.83)), last_qr_2, font=font, fill=color_text_2)
+    draw.text((int(w * 0.73), int(h * 0.83)), last_qr_scanner, font=font, fill=color_text_3)
     return np.array(img_pil)
 
 
@@ -315,12 +343,16 @@ def main():
         # Init scanner
         ep = get_scanner()
         scanner_digits = ''
+        # Init timers
+        timer_label_1 = time.time()
+        timer_label_2 = time.time()
+        timer_label_3 = time.time()
         # Create mysql table for qr data if not exist
         create_table(DB_CONFIG)
         # Init memory list
-        fifo_1 = []
-        fifo_2 = []
-        fifo_3 = []
+        fifo_video_1 = []
+        fifo_video_2 = []
+        fifo_scanner = []
         # Init ThreadPool and tasks
         pool = ThreadPool(processes=thread_num)
         video_tasks_1 = deque()
@@ -328,53 +360,56 @@ def main():
         scanner_tasks = deque()
         sound_tasks = deque()
         # Get video
-        cap_1 = cv2.VideoCapture(VIDEO_SOURCE_2)
-        cap_2 = cv2.VideoCapture(VIDEO_SOURCE_1)
+        cap_video_1 = cv2.VideoCapture(VIDEO_SOURCE_2)
+        cap_video_2 = cv2.VideoCapture(VIDEO_SOURCE_1)
         while True:
             # Fix time
             last_time = time.time()
             # Add tasks
             if (len(video_tasks_1) + len(video_tasks_2) + len(scanner_tasks)) < thread_num:
-                add_video_task(video_tasks_1, pool, cap_1, fifo_1, DB_LABEL_1, qr_logger)
-                add_video_task(video_tasks_2, pool, cap_2, fifo_2, DB_LABEL_2, qr_logger)
+                add_video_task(video_tasks_1, pool, cap_video_1, fifo_video_1, DB_LABEL_1, qr_logger)
+                add_video_task(video_tasks_2, pool, cap_video_2, fifo_video_2, DB_LABEL_2, qr_logger)
                 add_scanner_task(scanner_tasks, pool, ep, qr_logger)
             if len(sound_tasks)<1:
                 add_sound_task(sound_tasks, pool)
             while len(video_tasks_1) > 0 and video_tasks_1[0].ready() and\
                     len(video_tasks_2) > 0 and video_tasks_2[0].ready():
                 # Get frames and info about frames from tasks
-                frame_show_1, fifo_1, decodedObjects_1, sound_1 = get_frame(video_tasks_1, last_time, FPS=True)
-                frame_show_2, fifo_2, decodedObjects_2, sound_2 = get_frame(video_tasks_2, last_time, FPS=True)
+                frame_show_1, fifo_video_1, decodedObjects_1, sound_1 = get_frame(video_tasks_1, last_time, FPS=True)
+                frame_show_2, fifo_video_2, decodedObjects_2, sound_2 = get_frame(video_tasks_2, last_time, FPS=True)
                 if (sound_1 or sound_2) and len(sound_tasks)>0:
                     get_sound(sound_tasks)
                 scanner_digit = get_scanner_ch(scanner_tasks)
                 if scanner_digit:
                     scanner_digits = scanner_digits + str(scanner_digit)
-                if len(scanner_digits) >= 12:
-                    if scanner_digits[:2] == '94' and scanner_digits not in fifo_3:
-                        fifo_3.append(scanner_digits)
-                        now = datetime.now()
-                        new_data = {'data': scanner_digits,
-                                    'time': now.strftime("%Y/%m/%d %H:%M:%S"),
-                                    'route': 'scanner',
-                                    'check_flag': DEFAULT_FLAG}
-                        # Insert new qr code info with time registration to qr_table qr database
-                        push_to_db(new_data, qr_logger)
-                    scanner_digits = ''
-                    if len(fifo_3)>7:
-                        fifo_3 = fifo_3[-3:]
+                    fifo_scanner, scanner_digits, sound_3 =\
+                        process_obj(scanner_digits, fifo_scanner, 'scanner', qr_logger)
+                else:
+                    sound_3 = False
 
-                # Resize
-                frame_show_2 = frame_show_2[:360, :, :]
-                # Get current data for draw
-                last_qr_1 = get_last_or_empty(fifo_1, False)
-                last_qr_2 = get_last_or_empty(fifo_2, False)
-                last_qr_scanner = get_last_or_empty(fifo_3, False)
-                current_qr_1 = get_last_or_empty(decodedObjects_1, True)
-                current_qr_2 = get_last_or_empty(decodedObjects_2, True)
-                show_data = [last_qr_1, last_qr_2, last_qr_scanner, current_qr_1, current_qr_2, scanner_digits]
+                if sound_1: timer_label_1 = time.time()
+                if (last_time - timer_label_1) < LIGHT_DELAY: light_label_1 = True
+                else: light_label_1 = False
+                if sound_2: timer_label_2 = time.time()
+                if (last_time - timer_label_2) < LIGHT_DELAY: light_label_2 = True
+                else: light_label_2 = False
+                if sound_3: timer_label_3 = time.time()
+                if (last_time - timer_label_3) < LIGHT_DELAY: light_label_3 = True
+                else: light_label_3 = False
+
+                show_data = [fifo_video_1, fifo_video_2, fifo_scanner,\
+                             decodedObjects_1, decodedObjects_2, scanner_digits,\
+                             light_label_1, light_label_2, light_label_3]
                 # Draw final window
-                im = cv2.resize(create_bord(cv2.hconcat([frame_show_1, frame_show_2]), show_data), (1024, 768))
+                frames = cv2.hconcat([frame_show_1, frame_show_2])
+                if sound_3:
+                    # Make screen
+                    now = datetime.now()
+                    current_time = now.strftime("%Y_%m_%d_%H_%M_%S")
+                    # qr_logger.info('current_time_for_name: ', current_time)
+                    # qr_logger.info('os.listdir : ', os.listdir())
+                    cv2.imwrite(f'/home/super/qr_detection/screen/screen_{current_time}.jpg', frames)
+                im = cv2.resize(create_bord(frames, show_data), (1024, 768))
                 cv2.namedWindow('QR_registrator', cv2.WND_PROP_FULLSCREEN)
                 cv2.moveWindow('QR_registrator', 0, 0)
                 cv2.setWindowProperty('QR_registrator', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
